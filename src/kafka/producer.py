@@ -1,3 +1,4 @@
+#```python
 import json
 import logging
 
@@ -16,7 +17,9 @@ class TrafficKafkaProducer:
     Responsibilities:
         - Serialize TrafficEvent to JSON
         - Publish events to Kafka
-        - Handle delivery callbacks
+        - Confirm successful Kafka delivery
+        - Log topic, partition, and offset
+        - Handle delivery errors
         - Provide graceful shutdown
 
     Does NOT:
@@ -52,14 +55,20 @@ class TrafficKafkaProducer:
         )
 
         logger.info(
-            "Kafka producer initialized: %s",
+            "Kafka producer initialized | "
+            "bootstrap_servers=%s | "
+            "topic=%s",
             bootstrap_servers,
+            topic,
         )
 
     @staticmethod
     def event_to_dict(
-        event: TrafficEvent
+        event: TrafficEvent,
     ) -> dict:
+        """
+        Convert TrafficEvent into a JSON-serializable dictionary.
+        """
 
         return {
             "event_id": event.event_id,
@@ -81,23 +90,19 @@ class TrafficKafkaProducer:
         self,
         event: TrafficEvent,
     ):
-        def callback(
-            metadata,
-            exception,
-        ):
+        """
+        Callback executed after Kafka successfully
+        acknowledges message delivery.
+        """
 
-            if exception is not None:
+        def callback(metadata):
 
-                logger.error(
-                    "Kafka delivery failed | event_id=%s | error=%s",
-                    event.event_id,
-                    exception,
-                )
-
-                return
-
-            logger.debug(
-                "Kafka delivery successful | event_id=%s | topic=%s | partition=%s | offset=%s",
+            logger.info(
+                "ENTRY WRITTEN | "
+                "event_id=%s | "
+                "topic=%s | "
+                "partition=%s | "
+                "offset=%s",
                 event.event_id,
                 metadata.topic,
                 metadata.partition,
@@ -110,7 +115,19 @@ class TrafficKafkaProducer:
         self,
         event: TrafficEvent,
     ):
+        """
+        Publish a TrafficEvent to Kafka.
+        """
+
         message = self.event_to_dict(event)
+
+        logger.debug(
+            "Publishing event | "
+            "event_id=%s | "
+            "topic=%s",
+            event.event_id,
+            self.topic,
+        )
 
         future = self.producer.send(
             self.topic,
@@ -123,8 +140,12 @@ class TrafficKafkaProducer:
 
         future.add_errback(
             lambda exception: logger.error(
-                "Kafka send error | event_id=%s | error=%s",
+                "KAFKA WRITE FAILED | "
+                "event_id=%s | "
+                "topic=%s | "
+                "error=%s",
                 event.event_id,
+                self.topic,
                 exception,
             )
         )
@@ -132,10 +153,29 @@ class TrafficKafkaProducer:
         return future
 
     def flush(self):
-        logger.info("Flushing Kafka producer...")
+        """
+        Wait for all pending Kafka messages to be delivered.
+        """
+
+        logger.info(
+            "Flushing Kafka producer..."
+        )
+
         self.producer.flush()
 
     def close(self):
-        logger.info("Closing Kafka producer...")
+        """
+        Gracefully close the Kafka producer.
+        """
+
+        logger.info(
+            "Closing Kafka producer..."
+        )
+
         self.producer.flush()
         self.producer.close()
+
+        logger.info(
+            "Kafka producer closed."
+        )
+
