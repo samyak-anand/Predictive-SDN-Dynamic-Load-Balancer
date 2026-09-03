@@ -147,7 +147,7 @@ class TrafficKafkaConsumer:
             # Keep the current behavior for the first integration
             # test. Manual offset commits can be introduced before
             # large-scale production ingestion.
-            enable_auto_commit=True,
+            enable_auto_commit=False,
 
             # Prevent the consumer from blocking indefinitely
             # during tests or controlled shutdown.
