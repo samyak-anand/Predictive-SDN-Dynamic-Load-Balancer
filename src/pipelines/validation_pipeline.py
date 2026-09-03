@@ -3,35 +3,56 @@ from typing import Iterator
 
 from src.models.traffic_event import TrafficEvent
 from src.validators.traffic_validator import TrafficValidator
+from src.validators.duplicate_detector import DuplicateDetector
 
 
 @dataclass
 class ValidationResult:
     """
-    Stores the result of validating a batch/stream
-    of TrafficEvent objects.
+    Stores validation and duplicate detection statistics.
     """
 
     total_events: int = 0
     valid_events: int = 0
     invalid_events: int = 0
+    duplicate_events: int = 0
 
     validation_errors: list[dict] = field(
+        default_factory=list
+    )
+
+    duplicates: list[TrafficEvent] = field(
         default_factory=list
     )
 
 
 class ValidationPipeline:
     """
-    Validation pipeline responsible for applying
-    TrafficValidator to incoming TrafficEvent objects.
+    Validation pipeline responsible for applying:
 
-    Responsibilities:
-        - Consume TrafficEvent objects
-        - Validate each event
-        - Separate valid and invalid events
-        - Track validation statistics
-        - Track validation errors
+        1. Field-level validation
+        2. Duplicate detection
+
+    Processing flow:
+
+        TrafficEvent
+             |
+             v
+        TrafficValidator
+             |
+        +----+----+
+        |         |
+      invalid    valid
+        |         |
+        v         v
+      reject   DuplicateDetector
+                  |
+              +---+---+
+              |       |
+           duplicate  unique
+              |       |
+              v       v
+            reject   valid event
 
     Does NOT:
         - Parse XML
@@ -43,7 +64,8 @@ class ValidationPipeline:
 
     def __init__(
         self,
-        validator: TrafficValidator | None = None
+        validator: TrafficValidator | None = None,
+        duplicate_detector: DuplicateDetector | None = None,
     ):
         self.validator = (
             validator
@@ -51,32 +73,32 @@ class ValidationPipeline:
             else TrafficValidator()
         )
 
+        self.duplicate_detector = (
+            duplicate_detector
+            if duplicate_detector is not None
+            else DuplicateDetector()
+        )
+
     def process(
         self,
         events: Iterator[TrafficEvent]
     ) -> tuple[
         list[TrafficEvent],
-        list[dict]
+        list[dict],
+        list[TrafficEvent],
     ]:
         """
-        Validate a stream of TrafficEvent objects.
+        Process events through validation and duplicate detection.
 
-        Parameters
-        ----------
-        events:
-            Iterator of TrafficEvent objects.
-
-        Returns
-        -------
-        tuple
-            (
-                valid_events,
-                invalid_events
-            )
+        Returns:
+            valid_events
+            invalid_events
+            duplicate_events
         """
 
         valid_events = []
         invalid_events = []
+        duplicate_events = []
 
         for event in events:
 
@@ -87,42 +109,53 @@ class ValidationPipeline:
                 invalid_events.append(
                     {
                         "event": event,
-                        "errors": errors
+                        "errors": errors,
                     }
                 )
 
-            else:
+                continue
 
-                valid_events.append(event)
+            if self.duplicate_detector.is_duplicate(event):
 
-        return valid_events, invalid_events
+                duplicate_events.append(event)
+
+                continue
+
+            valid_events.append(event)
+
+        return (
+            valid_events,
+            invalid_events,
+            duplicate_events,
+        )
 
     def process_stream(
         self,
         events: Iterator[TrafficEvent]
     ) -> Iterator[TrafficEvent]:
         """
-        Validate events and yield only valid events.
+        Streaming version of the validation pipeline.
 
-        This method is useful later for Kafka
-        and other streaming components.
+        Only valid and unique events are yielded.
+
+        This method does not retain the valid events in memory.
         """
 
         for event in events:
 
             errors = self.validator.validate(event)
 
-            if not errors:
-                yield event
+            if errors:
+                continue
+
+            if self.duplicate_detector.is_duplicate(event):
+                continue
+
+            yield event
 
     def validate_event(
         self,
         event: TrafficEvent
     ) -> list[str]:
-        """
-        Validate a single TrafficEvent.
-        """
 
         return self.validator.validate(event)
-
-    

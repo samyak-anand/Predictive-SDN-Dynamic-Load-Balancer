@@ -1,190 +1,233 @@
-from pathlib import Path
-from collections import Counter
+from datetime import datetime
 
-from src.loaders.dataset_loader import DatasetLoader
+from src.models.traffic_event import TrafficEvent
 from src.pipelines.validation_pipeline import ValidationPipeline
 
 
-DATASET_PATH = Path(
-    "/home/samyak/PycharmProjects/"
-    "Predictive-SDN-Dynamic-Load-Balancer_data/"
-    "directed-abilene-zhang-5min-over-6months-ALL"
-)
-
-
-def main():
-
-    print("Starting XML + Native validation test...")
-    print()
-
-    loader = DatasetLoader(
-        dataset_name="abilene"
+def create_event(
+    timestamp="2004-03-01 00:00",
+    source="ATLAM5",
+    destination="ATLAng",
+    traffic=0.522208,
+):
+    return TrafficEvent(
+        event_id=(
+            f"abilene_{timestamp}_"
+            f"{source}_{destination}"
+        ),
+        timestamp=datetime.strptime(
+            timestamp,
+            "%Y-%m-%d %H:%M"
+        ),
+        source_node=source,
+        destination_node=destination,
+        traffic_mbps=traffic,
+        demand_id=f"{source}_{destination}",
+        granularity="5min",
+        unit="MBITPERSEC",
+        dataset="abilene",
+        source_format="sndlib_xml",
+        source_folder="test",
+        source_file="test.xml",
     )
+
+
+def test_valid_unique_event():
 
     pipeline = ValidationPipeline()
 
-    events = loader.load(DATASET_PATH)
+    event = create_event()
 
-    valid_events, invalid_events = (
-        pipeline.process(events)
+    valid, invalid, duplicates = pipeline.process(
+        iter([event])
     )
 
-    # -----------------------------------
-    # Basic validation statistics
-    # -----------------------------------
+    assert len(valid) == 1
+    assert len(invalid) == 0
+    assert len(duplicates) == 0
 
-    total_events = (
-        len(valid_events)
-        + len(invalid_events)
+
+def test_duplicate_event_is_detected():
+
+    pipeline = ValidationPipeline()
+
+    event1 = create_event()
+    event2 = create_event(
+        traffic=0.999999
     )
 
-    print("Validation Results")
-    print("------------------")
-
-    print(
-        f"Total events:   {total_events}"
+    valid, invalid, duplicates = pipeline.process(
+        iter([event1, event2])
     )
 
-    print(
-        f"Valid events:   {len(valid_events)}"
+    assert len(valid) == 1
+    assert len(invalid) == 0
+    assert len(duplicates) == 1
+
+    assert duplicates[0] == event2
+
+
+def test_invalid_event_is_rejected():
+
+    pipeline = ValidationPipeline()
+
+    event = create_event(
+        traffic=-10
     )
 
-    print(
-        f"Invalid events: {len(invalid_events)}"
+    valid, invalid, duplicates = pipeline.process(
+        iter([event])
     )
 
-    # -----------------------------------
-    # Source format analysis
-    # -----------------------------------
+    assert len(valid) == 0
+    assert len(invalid) == 1
+    assert len(duplicates) == 0
 
-    format_counts = Counter(
-        event.source_format
-        for event in valid_events
+
+def test_different_timestamp_is_unique():
+
+    pipeline = ValidationPipeline()
+
+    event1 = create_event(
+        timestamp="2004-03-01 00:00"
     )
 
-    print()
-    print("Source Format Distribution")
-    print("--------------------------")
-
-    for source_format, count in format_counts.items():
-
-        print(
-            f"{source_format}: {count}"
-        )
-
-    # -----------------------------------
-    # Source file analysis
-    # -----------------------------------
-
-    xml_events = [
-        event
-        for event in valid_events
-        if event.source_format == "sndlib_xml"
-    ]
-
-    native_events = [
-        event
-        for event in valid_events
-        if event.source_format == "sndlib_native"
-    ]
-
-    print()
-    print("Format Verification")
-    print("-------------------")
-
-    print(
-        f"XML events:    {len(xml_events)}"
+    event2 = create_event(
+        timestamp="2004-03-01 00:05"
     )
 
-    print(
-        f"Native events: {len(native_events)}"
+    valid, invalid, duplicates = pipeline.process(
+        iter([event1, event2])
     )
 
-    # -----------------------------------
-    # File verification
-    # -----------------------------------
+    assert len(valid) == 2
+    assert len(invalid) == 0
+    assert len(duplicates) == 0
 
-    xml_files = set(
-        event.source_file
-        for event in xml_events
+
+def test_different_source_is_unique():
+
+    pipeline = ValidationPipeline()
+
+    event1 = create_event(
+        source="ATLAM5"
     )
 
-    native_files = set(
-        event.source_file
-        for event in native_events
+    event2 = create_event(
+        source="CHINng"
     )
 
-    print()
-    print("Files Processed")
-    print("---------------")
-
-    print(
-        f"XML files:    {len(xml_files)}"
+    valid, invalid, duplicates = pipeline.process(
+        iter([event1, event2])
     )
 
-    print(
-        f"Native files: {len(native_files)}"
+    assert len(valid) == 2
+    assert len(invalid) == 0
+    assert len(duplicates) == 0
+
+
+def test_different_destination_is_unique():
+
+    pipeline = ValidationPipeline()
+
+    event1 = create_event(
+        destination="ATLAng"
     )
 
-    # -----------------------------------
-    # Sample events
-    # -----------------------------------
-
-    print()
-    print("Sample XML Event")
-    print("----------------")
-
-    if xml_events:
-        print(xml_events[0])
-
-    else:
-        print("No XML events found.")
-
-    print()
-    print("Sample Native Event")
-    print("-------------------")
-
-    if native_events:
-        print(native_events[0])
-
-    else:
-        print("No native events found.")
-
-    # -----------------------------------
-    # Assertions
-    # -----------------------------------
-
-    assert total_events > 0, (
-        "No events were processed."
+    event2 = create_event(
+        destination="CHINng"
     )
 
-    assert len(invalid_events) == 0, (
-        "Invalid events were detected."
+    valid, invalid, duplicates = pipeline.process(
+        iter([event1, event2])
     )
 
-    assert len(xml_events) > 0, (
-        "No XML events were processed."
+    assert len(valid) == 2
+    assert len(invalid) == 0
+    assert len(duplicates) == 0
+
+
+def test_process_stream_filters_duplicates():
+
+    pipeline = ValidationPipeline()
+
+    event1 = create_event()
+
+    event2 = create_event(
+        traffic=0.999999
     )
 
-    assert len(native_events) > 0, (
-        "No native events were processed."
+    events = pipeline.process_stream(
+        iter([event1, event2])
     )
 
-    assert (
-        len(xml_events) + len(native_events)
-        == total_events
-    ), (
-        "XML + Native event counts do not "
-        "match total events."
+    result = list(events)
+
+    assert len(result) == 1
+    assert result[0] == event1
+
+
+def test_process_stream_filters_invalid_events():
+
+    pipeline = ValidationPipeline()
+
+    valid_event = create_event()
+
+    invalid_event = create_event(
+        traffic=-5
     )
 
-    print()
-    print(
-        "SUCCESS: XML and Native data "
-        "passed through the same "
-        "validation pipeline."
+    events = pipeline.process_stream(
+        iter([
+            valid_event,
+            invalid_event,
+        ])
     )
+
+    result = list(events)
+
+    assert len(result) == 1
+    assert result[0] == valid_event
+
+
+def test_duplicate_detection_happens_after_validation():
+
+    pipeline = ValidationPipeline()
+
+    invalid_event = create_event(
+        traffic=-10
+    )
+
+    valid_event = create_event()
+
+    valid, invalid, duplicates = pipeline.process(
+        iter([
+            invalid_event,
+            valid_event,
+        ])
+    )
+
+    assert len(valid) == 1
+    assert len(invalid) == 1
+    assert len(duplicates) == 0
 
 
 if __name__ == "__main__":
-    main()
+
+    print(
+        "Running ValidationPipeline tests..."
+    )
+
+    test_valid_unique_event()
+    test_duplicate_event_is_detected()
+    test_invalid_event_is_rejected()
+    test_different_timestamp_is_unique()
+    test_different_source_is_unique()
+    test_different_destination_is_unique()
+    test_process_stream_filters_duplicates()
+    test_process_stream_filters_invalid_events()
+    test_duplicate_detection_happens_after_validation()
+
+    print(
+        "All ValidationPipeline tests passed."
+    )
