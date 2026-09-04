@@ -73,7 +73,8 @@ def create_valid_event() -> dict:
 
 def create_missing_field_event() -> dict:
     """
-    Create an invalid event where demand_id is missing.
+    Create an invalid event with the required demand_id
+    field removed.
     """
 
     event = create_valid_event()
@@ -110,15 +111,16 @@ def create_negative_traffic_event() -> dict:
 
 def publish_test_messages() -> dict:
     """
-    Publish one valid and three invalid messages
-    to traffic.raw.
+    Publish four integration-test messages to traffic.raw.
 
-    Test messages:
+    Messages:
 
-        1. Valid TrafficEvent
+        1. Valid event
         2. Invalid JSON
         3. Missing required field
         4. Negative traffic
+
+    Returns the event IDs needed for verification.
     """
 
     producer = KafkaProducer(
@@ -185,8 +187,7 @@ def publish_test_messages() -> dict:
             len(messages),
         )
 
-        # Verify that every message was successfully
-        # written to Kafka.
+        # Verify every message was actually written.
         for name, future in futures:
 
             metadata = future.get(
@@ -233,11 +234,25 @@ def consume_test_messages(
     """
     Consume traffic.raw using a unique consumer group.
 
-    The test verifies that the valid event survives the
-    validation layer and reaches downstream processing.
+    IMPORTANT:
 
-    Invalid events are expected to be routed to the DLQ
-    by TrafficKafkaConsumer.
+    We intentionally do NOT stop when the valid event is
+    received.
+
+    The four test messages can be distributed across
+    different Kafka partitions. If we stop immediately
+    after finding the valid event, the invalid messages
+    may never be processed and therefore never reach
+    the DLQ.
+
+    TrafficKafkaConsumer internally handles:
+        - JSON deserialization
+        - Event reconstruction
+        - Validation
+        - DLQ routing
+
+    This function only collects valid events that reach
+    downstream processing.
     """
 
     group_id = (
@@ -253,57 +268,60 @@ def consume_test_messages(
 
     consumed_valid_events = []
 
-    start_time = time.time()
+    valid_event_found = False
 
-    try:
+    logger.info(
+        "Starting raw-topic integration consumer | "
+        "group_id=%s",
+        group_id,
+    )
 
-        for event in consumer.consume():
+    # TrafficKafkaConsumer.consume() already closes
+    # the consumer in its own finally block.
+    for event in consumer.consume():
 
-            consumed_valid_events.append(
-                event
-            )
+        consumed_valid_events.append(
+            event
+        )
+
+        logger.info(
+            "DOWNSTREAM EVENT | "
+            "event_id=%s",
+            event.event_id,
+        )
+
+        if (
+            event.event_id
+            == expected_valid_event_id
+        ):
+
+            valid_event_found = True
 
             logger.info(
-                "DOWNSTREAM EVENT | "
-                "event_id=%s",
-                event.event_id,
+                "Expected valid event received."
             )
 
-            # Stop as soon as our expected valid event
-            # reaches downstream.
-            if (
-                event.event_id
-                == expected_valid_event_id
-            ):
+        # IMPORTANT:
+        #
+        # DO NOT BREAK HERE.
+        #
+        # We must allow TrafficKafkaConsumer to continue
+        # processing the other partitions so that the
+        # invalid test messages reach traffic.dlq.
 
-                logger.info(
-                    "Expected valid event received."
-                )
-
-                break
-
-            # Safety timeout.
-            if (
-                time.time() - start_time
-                > 15
-            ):
-
-                logger.warning(
-                    "Timeout waiting for "
-                    "valid event."
-                )
-
-                break
-
-    finally:
-
-        consumer.close()
+    logger.info(
+        "Raw-topic integration consumption completed | "
+        "valid_event_found=%s | "
+        "valid_events=%d",
+        valid_event_found,
+        len(consumed_valid_events),
+    )
 
     return consumed_valid_events
 
 
 # ============================================================
-# CONSUME AND VERIFY DLQ
+# CONSUME DLQ
 # ============================================================
 
 
@@ -312,14 +330,16 @@ def consume_dlq_messages(
     timeout_seconds: int = 15,
 ):
     """
-    Consume traffic.dlq and wait until all expected
-    integration-test event IDs are found.
+    Consume traffic.dlq and find the invalid events created
+    by the current integration-test execution.
 
-    A unique consumer group is used so the test can
-    start from the beginning of the DLQ topic.
+    The DLQ already contains historical test records.
 
-    Historical DLQ records are ignored unless their
-    event_id belongs to this test.
+    Therefore, this function ignores every DLQ record whose
+    event_id does not belong to the current test.
+
+    The function exits early once all expected event IDs
+    have been found.
     """
 
     group_id = (
@@ -360,7 +380,6 @@ def consume_dlq_messages(
                 timeout_ms=1000
             )
 
-            # No records received yet.
             if not records:
 
                 continue
@@ -393,8 +412,7 @@ def consume_dlq_messages(
                         validation_stage,
                     )
 
-                    # Ignore historical DLQ messages
-                    # that do not belong to this test.
+                    # Ignore historical DLQ records.
                     if (
                         event_id
                         not in expected_event_ids
@@ -402,9 +420,12 @@ def consume_dlq_messages(
 
                         continue
 
-                    # Prevent duplicate records from being
-                    # added to the result.
-                    if event_id in received_ids:
+                    # Prevent duplicate records from
+                    # being counted twice.
+                    if (
+                        event_id
+                        in received_ids
+                    ):
 
                         continue
 
@@ -425,8 +446,7 @@ def consume_dlq_messages(
                         len(expected_event_ids),
                     )
 
-            # Stop when every expected invalid event
-            # has been found.
+            # We found every expected invalid event.
             if (
                 received_ids
                 == expected_event_ids
@@ -454,7 +474,7 @@ def consume_dlq_messages(
 
 
 # ============================================================
-# MAIN INTEGRATION TEST
+# MAIN TEST
 # ============================================================
 
 
@@ -484,21 +504,21 @@ def main():
     test_ids = publish_test_messages()
 
     logger.info(
-        "Test IDs created:"
+        "Test messages published successfully."
     )
 
     logger.info(
-        "Valid event ID: %s",
+        "VALID EVENT ID: %s",
         test_ids["valid_event_id"],
     )
 
     logger.info(
-        "Missing field event ID: %s",
+        "MISSING FIELD EVENT ID: %s",
         test_ids["missing_field_event_id"],
     )
 
     logger.info(
-        "Negative traffic event ID: %s",
+        "NEGATIVE TRAFFIC EVENT ID: %s",
         test_ids["negative_event_id"],
     )
 
@@ -522,7 +542,7 @@ def main():
         for event in valid_events
     }
 
-    # Verify valid event reached downstream.
+    # Verify the valid event reached downstream.
     assert (
         test_ids["valid_event_id"]
         in valid_event_ids
@@ -572,8 +592,7 @@ def main():
         dlq_event_ids,
     )
 
-    # Verify every expected invalid event reached
-    # the DLQ.
+    # Verify both expected invalid events.
     assert (
         expected_dlq_ids
         <= dlq_event_ids
@@ -588,53 +607,92 @@ def main():
 
     # ========================================================
     # STEP 4
-    # Validate DLQ structure
+    # Validate DLQ metadata
     # ========================================================
 
     logger.info(
         "STEP 4: Validating DLQ metadata..."
     )
 
+    required_dlq_fields = {
+        "original_topic",
+        "partition",
+        "offset",
+        "error_type",
+        "error_message",
+        "validation_stage",
+        "payload_base64",
+    }
+
     for record in dlq_records:
 
+        # Original Kafka topic.
         assert (
             record["original_topic"]
             == RAW_TOPIC
         )
 
-        assert (
-            "partition"
-            in record
-        )
+        # Check required metadata fields.
+        for field in required_dlq_fields:
 
-        assert (
-            "offset"
-            in record
-        )
-
-        assert (
-            "error_type"
-            in record
-        )
-
-        assert (
-            "error_message"
-            in record
-        )
-
-        assert (
-            "validation_stage"
-            in record
-        )
-
-        assert (
-            "payload_base64"
-            in record
-        )
+            assert field in record, (
+                f"DLQ record missing required "
+                f"field: {field}"
+            )
 
     logger.info(
         "PASS: DLQ metadata and original "
         "payload were preserved."
+    )
+
+    # ========================================================
+    # STEP 5
+    # Validate specific error types
+    # ========================================================
+
+    logger.info(
+        "STEP 5: Validating DLQ error classification..."
+    )
+
+    records_by_event_id = {
+        record["event_id"]: record
+        for record in dlq_records
+    }
+
+    missing_record = records_by_event_id[
+        test_ids["missing_field_event_id"]
+    ]
+
+    negative_record = records_by_event_id[
+        test_ids["negative_event_id"]
+    ]
+
+    # Missing demand_id should fail during
+    # event reconstruction.
+    assert (
+        missing_record["error_type"]
+        == "KeyError"
+    )
+
+    assert (
+        missing_record["validation_stage"]
+        == "event_reconstruction"
+    )
+
+    # Negative traffic should fail during
+    # traffic validation.
+    assert (
+        negative_record["error_type"]
+        == "TrafficValidationError"
+    )
+
+    assert (
+        negative_record["validation_stage"]
+        == "traffic_validation"
+    )
+
+    logger.info(
+        "PASS: DLQ error classification is correct."
     )
 
     # ========================================================
