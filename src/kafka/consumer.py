@@ -3,7 +3,8 @@ import logging
 from datetime import datetime
 from typing import Iterator
 
-from kafka import KafkaConsumer
+from kafka import KafkaConsumer, TopicPartition
+from kafka.structs import OffsetAndMetadata
 
 from src.models.traffic_event import TrafficEvent
 from src.validators.traffic_validator import TrafficValidator
@@ -46,22 +47,23 @@ class TrafficKafkaConsumer:
     yield   traffic.dlq
     event
 
-    Responsibilities:
-        - Connect to Kafka
-        - Consume raw Kafka messages
-        - Deserialize JSON
-        - Reconstruct TrafficEvent
-        - Validate TrafficEvent
-        - Yield valid events
-        - Route invalid messages to DLQ
-        - Log processing failures
-        - Gracefully close
+    Offset management:
 
-    Does NOT:
-        - Parse XML/TXT files
-        - Perform feature engineering
-        - Perform ML prediction
-        - Perform SDN decisions
+        Consume message
+             |
+             v
+        Downstream processing
+             |
+             v
+        Successful processing
+             |
+             v
+        commit_last_message()
+
+    Kafka offsets are committed manually.
+
+    The offset committed for message N is N + 1 because
+    Kafka stores the NEXT offset to consume.
     """
 
     def __init__(
@@ -106,6 +108,12 @@ class TrafficKafkaConsumer:
         self.group_id = group_id
 
         # ----------------------------------------------------------
+        # Track the Kafka message currently being processed
+        # ----------------------------------------------------------
+
+        self.last_message = None
+
+        # ----------------------------------------------------------
         # Traffic validator
         # ----------------------------------------------------------
 
@@ -138,19 +146,15 @@ class TrafficKafkaConsumer:
             group_id=group_id,
             auto_offset_reset=auto_offset_reset,
 
-            # Consume raw bytes.
-            #
-            # JSON deserialization is handled manually so that
-            # malformed messages can be routed to the DLQ.
+            # Raw bytes are consumed so malformed messages
+            # can be explicitly handled and sent to the DLQ.
             value_deserializer=None,
 
-            # Keep the current behavior for the first integration
-            # test. Manual offset commits can be introduced before
-            # large-scale production ingestion.
+            # Manual offset management.
             enable_auto_commit=False,
 
-            # Prevent the consumer from blocking indefinitely
-            # during tests or controlled shutdown.
+            # Prevent indefinite blocking during controlled
+            # test execution and shutdown.
             consumer_timeout_ms=1000,
         )
 
@@ -158,10 +162,12 @@ class TrafficKafkaConsumer:
             "Kafka consumer initialized | "
             "bootstrap_servers=%s | "
             "topic=%s | "
-            "group_id=%s",
+            "group_id=%s | "
+            "auto_commit=%s",
             bootstrap_servers,
             topic,
             group_id,
+            False,
         )
 
     # ==============================================================
@@ -304,6 +310,63 @@ class TrafficKafkaConsumer:
         )
 
     # ==============================================================
+    # OFFSET COMMIT
+    # ==============================================================
+
+    def commit_last_message(self) -> None:
+        """
+        Commit the offset of the last successfully processed
+        Kafka message.
+
+        Kafka commits the NEXT offset to consume.
+
+        Example:
+
+            Processed offset = 10
+            Committed offset = 11
+
+        This method must only be called AFTER downstream
+        processing has completed successfully.
+        """
+
+        if self.last_message is None:
+            raise RuntimeError(
+                "No Kafka message available for offset commit."
+            )
+
+        message = self.last_message
+
+        topic_partition = TopicPartition(
+            message.topic,
+            message.partition,
+        )
+
+        next_offset = message.offset + 1
+
+        offsets = {
+            topic_partition: OffsetAndMetadata(
+                next_offset,
+                None,
+            )
+        }
+
+        self.consumer.commit(
+            offsets=offsets
+        )
+
+        logger.info(
+            "KAFKA OFFSET COMMITTED | "
+            "topic=%s | "
+            "partition=%s | "
+            "processed_offset=%s | "
+            "committed_offset=%s",
+            message.topic,
+            message.partition,
+            message.offset,
+            next_offset,
+        )
+
+    # ==============================================================
     # CONSUME
     # ==============================================================
 
@@ -313,34 +376,19 @@ class TrafficKafkaConsumer:
         """
         Consume and validate Kafka messages.
 
-        Processing:
+        Valid events are yielded downstream.
 
-            Kafka message
-                |
-                v
-            Deserialize JSON
-                |
-                +--------------------+
-                |                    |
-              VALID                INVALID
-                |                    |
-                v                    v
-          Build TrafficEvent     traffic.dlq
-                |
-                v
-          Validate TrafficEvent
-                |
-              +---+---+
-              |       |
-            VALID   INVALID
-              |       |
-              v       v
-            yield   traffic.dlq
-            event
+        Invalid messages are sent to the DLQ.
 
-        Valid events continue downstream.
+        IMPORTANT:
 
-        Invalid messages are published to the DLQ and skipped.
+        This method does NOT automatically commit offsets.
+
+        The downstream consumer must call:
+
+            commit_last_message()
+
+        after successful processing.
         """
 
         logger.info(
@@ -354,6 +402,12 @@ class TrafficKafkaConsumer:
         try:
 
             for message in self.consumer:
+
+                # --------------------------------------------------
+                # Store exact Kafka message being processed.
+                # --------------------------------------------------
+
+                self.last_message = message
 
                 # ==================================================
                 # STEP 1: DESERIALIZE JSON
@@ -500,7 +554,14 @@ class TrafficKafkaConsumer:
                     message.offset,
                 )
 
-                # Valid event continues downstream.
+                # --------------------------------------------------
+                # Pass valid event downstream.
+                #
+                # The downstream processor is responsible for
+                # committing the Kafka offset AFTER successful
+                # processing.
+                # --------------------------------------------------
+
                 yield event
 
         except KeyboardInterrupt:
