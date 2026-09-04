@@ -29,33 +29,38 @@ class TrafficKafkaConsumer:
           v
         JSON deserialization
           |
-        +---------+
-        |         |
-      VALID     INVALID
-        |         |
-        v         v
-    TrafficEvent  traffic.dlq
-        |
-        v
-    TrafficValidator
-        |
-      +---+---+
-      |       |
-    VALID   INVALID
-      |       |
-      v       v
-    yield   traffic.dlq
-    event
+        +----------------+
+        |                |
+      SUCCESS          FAILURE
+        |                |
+        v                v
+    TrafficEvent       traffic.dlq
+        |                |
+        v                v
+    Validation        Kafka ACK
+        |                |
+      +---+---+          |
+      |       |          |
+    VALID   INVALID      |
+      |       |          |
+      v       v          |
+    yield   traffic.dlq  |
+    event       |        |
+                v        |
+            Kafka ACK    |
+                |        |
+                +----+---+
+                     |
+                     v
+              Commit raw offset
 
     Offset management:
 
         Consume message
              |
              v
-        Downstream processing
-             |
-             v
-        Successful processing
+        Successful downstream
+        processing / DLQ ACK
              |
              v
         commit_last_message()
@@ -146,8 +151,8 @@ class TrafficKafkaConsumer:
             group_id=group_id,
             auto_offset_reset=auto_offset_reset,
 
-            # Raw bytes are consumed so malformed messages
-            # can be explicitly handled and sent to the DLQ.
+            # Consume raw bytes so malformed messages can
+            # be explicitly handled and sent to the DLQ.
             value_deserializer=None,
 
             # Manual offset management.
@@ -294,11 +299,29 @@ class TrafficKafkaConsumer:
         """
         Send a failed Kafka message to the Dead Letter Queue.
 
-        The original Kafka metadata and payload are preserved
-        by TrafficDLQProducer.
+        IMPORTANT:
+
+        The raw Kafka offset must NOT be committed until
+        Kafka acknowledges the DLQ message.
+
+        Processing sequence:
+
+            raw message
+                 |
+                 v
+            publish DLQ
+                 |
+                 v
+             Kafka ACK
+                 |
+                 v
+          return successfully
+
+        If the DLQ publish fails, future.get() raises an
+        exception and the caller must NOT commit the raw offset.
         """
 
-        self.dlq_producer.send(
+        future = self.dlq_producer.send(
             original_topic=message.topic,
             partition=message.partition,
             offset=message.offset,
@@ -307,6 +330,30 @@ class TrafficKafkaConsumer:
             error_message=error_message,
             validation_stage=validation_stage,
             event_id=event_id,
+        )
+
+        # ----------------------------------------------------------
+        # WAIT FOR KAFKA ACK
+        # ----------------------------------------------------------
+
+        metadata = future.get(
+            timeout=10
+        )
+
+        logger.info(
+            "DLQ ACK RECEIVED | "
+            "original_topic=%s | "
+            "original_partition=%s | "
+            "original_offset=%s | "
+            "dlq_topic=%s | "
+            "dlq_partition=%s | "
+            "dlq_offset=%s",
+            message.topic,
+            message.partition,
+            message.offset,
+            metadata.topic,
+            metadata.partition,
+            metadata.offset,
         )
 
     # ==============================================================
@@ -370,233 +417,397 @@ class TrafficKafkaConsumer:
     # CONSUME
     # ==============================================================
 
-    def consume(
-        self,
-    ) -> Iterator[TrafficEvent]:
+    def consume(self) -> Iterator[TrafficEvent]:
         """
-        Consume and validate Kafka messages.
+        Consume, deserialize, reconstruct and validate Kafka messages.
 
-        Valid events are yielded downstream.
+        Valid messages:
+            - Yield TrafficEvent to downstream consumer.
+            - Downstream component is responsible for committing
+              the raw Kafka offset.
 
-        Invalid messages are sent to the DLQ.
+        Invalid messages:
+            - Publish the original Kafka message to the DLQ.
+            - Wait for Kafka DLQ acknowledgement.
+            - Commit the raw Kafka offset ONLY after DLQ ACK.
+            - Do not yield the invalid event.
 
-        IMPORTANT:
-
-        This method does NOT automatically commit offsets.
-
-        The downstream consumer must call:
-
-            commit_last_message()
-
-        after successful processing.
+        This prevents poison messages from repeatedly blocking
+        the consumer after they have been safely captured in the DLQ.
         """
 
-        logger.info(
-            "Starting Kafka consumption | "
-            "topic=%s | "
-            "group_id=%s",
-            self.topic,
-            self.group_id,
-        )
+        for message in self.consumer:
 
-        try:
+            # ------------------------------------------------------
+            # Store current Kafka message
+            # ------------------------------------------------------
 
-            for message in self.consumer:
+            self.last_message = message
 
-                # --------------------------------------------------
-                # Store exact Kafka message being processed.
-                # --------------------------------------------------
+            logger.info(
+                "KAFKA MESSAGE RECEIVED | "
+                "topic=%s | "
+                "partition=%s | "
+                "offset=%s",
+                message.topic,
+                message.partition,
+                message.offset,
+            )
 
-                self.last_message = message
+            # ======================================================
+            # STEP 1: DESERIALIZATION
+            # ======================================================
 
-                # ==================================================
-                # STEP 1: DESERIALIZE JSON
-                # ==================================================
+            try:
 
-                try:
-
-                    payload = self.deserialize_message(
-                        message.value
-                    )
-
-                except (
-                    UnicodeDecodeError,
-                    json.JSONDecodeError,
-                    TypeError,
-                ) as exception:
-
-                    logger.error(
-                        "INVALID KAFKA MESSAGE | "
-                        "topic=%s | "
-                        "partition=%s | "
-                        "offset=%s | "
-                        "error=%s",
-                        message.topic,
-                        message.partition,
-                        message.offset,
-                        exception,
-                    )
-
-                    self.send_to_dlq(
-                        message=message,
-                        error_type=type(
-                            exception
-                        ).__name__,
-                        error_message=str(
-                            exception
-                        ),
-                        validation_stage=(
-                            "deserialization"
-                        ),
-                    )
-
-                    continue
-
-                # ==================================================
-                # STEP 2: RECONSTRUCT TRAFFIC EVENT
-                # ==================================================
-
-                try:
-
-                    event = self.message_to_event(
-                        payload
-                    )
-
-                except (
-                    KeyError,
-                    TypeError,
-                    ValueError,
-                ) as exception:
-
-                    logger.error(
-                        "INVALID EVENT STRUCTURE | "
-                        "topic=%s | "
-                        "partition=%s | "
-                        "offset=%s | "
-                        "error=%s",
-                        message.topic,
-                        message.partition,
-                        message.offset,
-                        exception,
-                    )
-
-                    self.send_to_dlq(
-                        message=message,
-                        error_type=type(
-                            exception
-                        ).__name__,
-                        error_message=str(
-                            exception
-                        ),
-                        validation_stage=(
-                            "event_reconstruction"
-                        ),
-                        event_id=payload.get(
-                            "event_id"
-                        ),
-                    )
-
-                    continue
-
-                # ==================================================
-                # STEP 3: VALIDATE TRAFFIC EVENT
-                # ==================================================
-
-                errors = self.validate_event(
-                    event
+                payload = self.deserialize_message(
+                    message.value
                 )
 
-                if errors:
+            except Exception as exception:
 
-                    logger.error(
-                        "INVALID EVENT | "
+                logger.exception(
+                    "MESSAGE DESERIALIZATION FAILED | "
+                    "topic=%s | "
+                    "partition=%s | "
+                    "offset=%s | "
+                    "error=%s",
+                    message.topic,
+                    message.partition,
+                    message.offset,
+                    exception,
+                )
+
+                try:
+
+                    # ----------------------------------------------
+                    # Publish malformed message to DLQ.
+                    # ----------------------------------------------
+
+                    self.send_to_dlq(
+                        message=message,
+                        error_type=type(exception).__name__,
+                        error_message=str(exception),
+                        validation_stage="deserialization",
+                    )
+
+                    # ----------------------------------------------
+                    # DLQ ACK received.
+                    #
+                    # Safe to commit the raw offset.
+                    # ----------------------------------------------
+
+                    self.commit_last_message()
+
+                    logger.info(
+                        "INVALID MESSAGE HANDLED | "
+                        "stage=deserialization | "
+                        "topic=%s | "
+                        "partition=%s | "
+                        "offset=%s",
+                        message.topic,
+                        message.partition,
+                        message.offset,
+                    )
+
+                except Exception as dlq_exception:
+
+                    logger.exception(
+                        "DLQ PROCESSING FAILED | "
+                        "topic=%s | "
+                        "partition=%s | "
+                        "offset=%s | "
+                        "error=%s",
+                        message.topic,
+                        message.partition,
+                        message.offset,
+                        dlq_exception,
+                    )
+
+                    # ----------------------------------------------
+                    # IMPORTANT:
+                    #
+                    # Do NOT commit the raw offset.
+                    #
+                    # The message remains replayable.
+                    # ----------------------------------------------
+
+                continue
+
+            # ======================================================
+            # STEP 2: EVENT RECONSTRUCTION
+            # ======================================================
+
+            try:
+
+                event = self.message_to_event(
+                    payload
+                )
+
+            except Exception as exception:
+
+                event_id = payload.get(
+                    "event_id"
+                ) if isinstance(
+                    payload,
+                    dict
+                ) else None
+
+                logger.exception(
+                    "EVENT RECONSTRUCTION FAILED | "
+                    "event_id=%s | "
+                    "topic=%s | "
+                    "partition=%s | "
+                    "offset=%s | "
+                    "error=%s",
+                    event_id,
+                    message.topic,
+                    message.partition,
+                    message.offset,
+                    exception,
+                )
+
+                try:
+
+                    self.send_to_dlq(
+                        message=message,
+                        error_type=type(exception).__name__,
+                        error_message=str(exception),
+                        validation_stage="event_reconstruction",
+                        event_id=event_id,
+                    )
+
+                    self.commit_last_message()
+
+                    logger.info(
+                        "INVALID MESSAGE HANDLED | "
+                        "stage=event_reconstruction | "
+                        "event_id=%s | "
+                        "topic=%s | "
+                        "partition=%s | "
+                        "offset=%s",
+                        event_id,
+                        message.topic,
+                        message.partition,
+                        message.offset,
+                    )
+
+                except Exception as dlq_exception:
+
+                    logger.exception(
+                        "DLQ PROCESSING FAILED | "
+                        "stage=event_reconstruction | "
                         "event_id=%s | "
                         "topic=%s | "
                         "partition=%s | "
                         "offset=%s | "
-                        "errors=%s",
-                        event.event_id,
+                        "error=%s",
+                        event_id,
                         message.topic,
                         message.partition,
                         message.offset,
-                        errors,
+                        dlq_exception,
                     )
 
-                    self.send_to_dlq(
-                        message=message,
-                        error_type=(
-                            "TrafficValidationError"
-                        ),
-                        error_message="; ".join(
-                            errors
-                        ),
-                        validation_stage=(
-                            "traffic_validation"
-                        ),
-                        event_id=event.event_id,
-                    )
+                continue
 
-                    continue
+            # ======================================================
+            # STEP 3: BUSINESS VALIDATION
+            # ======================================================
 
-                # ==================================================
-                # STEP 4: VALID EVENT
-                # ==================================================
+            try:
 
-                logger.info(
-                    "ENTRY RECEIVED | "
+                validation_errors = self.validate_event(
+                    event
+                )
+
+            except Exception as exception:
+
+                logger.exception(
+                    "VALIDATION EXECUTION FAILED | "
                     "event_id=%s | "
                     "topic=%s | "
                     "partition=%s | "
-                    "offset=%s",
+                    "offset=%s | "
+                    "error=%s",
                     event.event_id,
                     message.topic,
                     message.partition,
                     message.offset,
+                    exception,
                 )
 
-                # --------------------------------------------------
-                # Pass valid event downstream.
-                #
-                # The downstream processor is responsible for
-                # committing the Kafka offset AFTER successful
-                # processing.
-                # --------------------------------------------------
+                try:
 
-                yield event
+                    self.send_to_dlq(
+                        message=message,
+                        error_type=type(exception).__name__,
+                        error_message=str(exception),
+                        validation_stage="validation",
+                        event_id=event.event_id,
+                    )
 
-        except KeyboardInterrupt:
+                    self.commit_last_message()
+
+                    logger.info(
+                        "INVALID MESSAGE HANDLED | "
+                        "stage=validation | "
+                        "event_id=%s | "
+                        "topic=%s | "
+                        "partition=%s | "
+                        "offset=%s",
+                        event.event_id,
+                        message.topic,
+                        message.partition,
+                        message.offset,
+                    )
+
+                except Exception as dlq_exception:
+
+                    logger.exception(
+                        "DLQ PROCESSING FAILED | "
+                        "stage=validation | "
+                        "event_id=%s | "
+                        "topic=%s | "
+                        "partition=%s | "
+                        "offset=%s | "
+                        "error=%s",
+                        event.event_id,
+                        message.topic,
+                        message.partition,
+                        message.offset,
+                        dlq_exception,
+                    )
+
+                continue
+
+            # ======================================================
+            # STEP 4: VALIDATION RESULT
+            # ======================================================
+
+            if validation_errors:
+
+                error_message = "; ".join(
+                    validation_errors
+                )
+
+                logger.warning(
+                    "EVENT VALIDATION FAILED | "
+                    "event_id=%s | "
+                    "topic=%s | "
+                    "partition=%s | "
+                    "offset=%s | "
+                    "errors=%s",
+                    event.event_id,
+                    message.topic,
+                    message.partition,
+                    message.offset,
+                    error_message,
+                )
+
+                try:
+
+                    self.send_to_dlq(
+                        message=message,
+                        error_type="ValidationError",
+                        error_message=error_message,
+                        validation_stage="validation",
+                        event_id=event.event_id,
+                    )
+
+                    self.commit_last_message()
+
+                    logger.info(
+                        "INVALID MESSAGE HANDLED | "
+                        "stage=validation | "
+                        "event_id=%s | "
+                        "topic=%s | "
+                        "partition=%s | "
+                        "offset=%s",
+                        event.event_id,
+                        message.topic,
+                        message.partition,
+                        message.offset,
+                    )
+
+                except Exception as dlq_exception:
+
+                    logger.exception(
+                        "DLQ PROCESSING FAILED | "
+                        "stage=validation | "
+                        "event_id=%s | "
+                        "topic=%s | "
+                        "partition=%s | "
+                        "offset=%s | "
+                        "error=%s",
+                        event.event_id,
+                        message.topic,
+                        message.partition,
+                        message.offset,
+                        dlq_exception,
+                    )
+
+                continue
+
+            # ======================================================
+            # STEP 5: VALID EVENT
+            # ======================================================
 
             logger.info(
-                "Kafka consumer interrupted."
+                "EVENT VALIDATION SUCCESS | "
+                "event_id=%s | "
+                "topic=%s | "
+                "partition=%s | "
+                "offset=%s",
+                event.event_id,
+                message.topic,
+                message.partition,
+                message.offset,
             )
 
-        finally:
+            # ------------------------------------------------------
+            # Yield valid event to downstream processing.
+            #
+            # The downstream component is responsible for:
+            #
+            #     publish to traffic.validated
+            #                 ↓
+            #             Kafka ACK
+            #                 ↓
+            #         commit_last_message()
+            #
+            # ------------------------------------------------------
 
-            self.close()
+            yield event
 
     # ==============================================================
     # CLOSE
     # ==============================================================
 
-    def close(
-        self,
-    ) -> None:
+    def close(self) -> None:
         """
-        Gracefully close the Kafka consumer
-        and DLQ producer.
+        Gracefully close Kafka resources.
         """
 
-        logger.info(
-            "Closing Kafka consumer..."
-        )
+        try:
 
-        self.consumer.close()
+            self.consumer.close()
 
-        logger.info(
-            "Closing DLQ producer..."
-        )
+        except Exception:
 
-        self.dlq_producer.close()
+            logger.exception(
+                "Error closing Kafka consumer."
+            )
+
+        try:
+
+            self.dlq_producer.close()
+
+        except Exception:
+
+            logger.exception(
+                "Error closing DLQ producer."
+            )
 
         logger.info(
             "Kafka consumer and DLQ producer closed."
