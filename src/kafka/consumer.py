@@ -156,11 +156,11 @@ class TrafficKafkaConsumer:
             value_deserializer=None,
 
             # Manual offset management.
-            enable_auto_commit=False,
+            enable_auto_commit=False
 
             # Prevent indefinite blocking during controlled
             # test execution and shutdown.
-            consumer_timeout_ms=1000,
+            #consumer_timeout_ms=1000,
         )
 
         logger.info(
