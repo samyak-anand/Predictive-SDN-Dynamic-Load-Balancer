@@ -34,6 +34,15 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--start-file",
+        default=None,
+        help=(
+            "Start ingestion from this dataset filename. "
+            "Files before this file are skipped."
+        ),
+    )
+
+    parser.add_argument(
         "--limit",
         type=int,
         default=0,
@@ -69,11 +78,20 @@ def run():
     logger.info("=" * 70)
     logger.info("Starting Dataset → Kafka ingestion")
     logger.info("=" * 70)
+
     logger.info("Dataset root : %s", data_root)
     logger.info("Format       : %s", args.format)
     logger.info("Dataset path : %s", dataset_dir)
-    logger.info("Event limit  : %s", args.limit or "ALL")
+    logger.info(
+        "Start file   : %s",
+        args.start_file or "BEGINNING",
+    )
+    logger.info(
+        "Event limit  : %s",
+        args.limit or "ALL",
+    )
     logger.info("Kafka topic  : traffic.raw")
+
     logger.info("=" * 70)
 
     if not dataset_dir.exists():
@@ -81,7 +99,9 @@ def run():
             f"Dataset directory does not exist: {dataset_dir}"
         )
 
-    loader = DatasetLoader(dataset_name="abilene")
+    loader = DatasetLoader(
+        dataset_name="abilene"
+    )
 
     producer = TrafficKafkaProducer(
         bootstrap_servers="localhost:9092",
@@ -92,15 +112,25 @@ def run():
     start_time = time.time()
 
     try:
-        for event in loader.load(dataset_dir):
+
+        for event in loader.load(
+            dataset_dir,
+            start_file=args.start_file,
+        ):
 
             producer.send(event)
 
             total += 1
 
             if total % args.progress_every == 0:
+
                 elapsed = time.time() - start_time
-                rate = total / elapsed if elapsed > 0 else 0
+
+                rate = (
+                    total / elapsed
+                    if elapsed > 0
+                    else 0
+                )
 
                 logger.info(
                     "INGESTION PROGRESS | "
@@ -112,34 +142,55 @@ def run():
                 )
 
             if args.limit > 0 and total >= args.limit:
+
                 logger.info(
                     "Event limit reached: %d",
-                    args.limit,
+                    total,
                 )
+
                 break
 
         logger.info(
-            "Waiting for Kafka to acknowledge pending messages..."
+            "Waiting for Kafka to acknowledge "
+            "pending messages..."
         )
 
         producer.flush()
 
         elapsed = time.time() - start_time
-        rate = total / elapsed if elapsed > 0 else 0
+
+        rate = (
+            total / elapsed
+            if elapsed > 0
+            else 0
+        )
 
         logger.info("=" * 70)
         logger.info("Dataset ingestion completed")
-        logger.info("Total events published : %d", total)
-        logger.info("Elapsed time           : %.2f sec", elapsed)
-        logger.info("Average rate           : %.2f events/sec", rate)
+        logger.info(
+            "Total events published : %d",
+            total,
+        )
+        logger.info(
+            "Elapsed time           : %.2f sec",
+            elapsed,
+        )
+        logger.info(
+            "Average rate           : %.2f events/sec",
+            rate,
+        )
         logger.info("=" * 70)
 
     except KeyboardInterrupt:
-        logger.warning("Ingestion interrupted by user.")
+
+        logger.warning(
+            "Ingestion interrupted by user."
+        )
 
         producer.flush()
 
     finally:
+
         producer.close()
 
 

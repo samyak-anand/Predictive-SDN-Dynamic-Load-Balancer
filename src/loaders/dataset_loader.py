@@ -15,6 +15,7 @@ class DatasetLoader:
         - Discover supported dataset files
         - Route files to the appropriate parser
         - Stream TrafficEvent objects
+        - Support deterministic resume from a specific file
 
     The loader does NOT:
         - Validate traffic data
@@ -38,7 +39,8 @@ class DatasetLoader:
 
     def load(
         self,
-        directory: str | Path
+        directory: str | Path,
+        start_file: str | None = None
     ) -> Iterator[TrafficEvent]:
         """
         Discover and stream events from the dataset directory.
@@ -47,6 +49,13 @@ class DatasetLoader:
         ----------
         directory:
             Path to the external dataset directory.
+
+        start_file:
+            Optional filename from which ingestion should begin.
+            All supported files before this filename are skipped.
+
+            Example:
+                demandMatrix-abilene-zhang-5min-20040821-0055.txt
 
         Yields
         ------
@@ -65,7 +74,38 @@ class DatasetLoader:
                 f"No supported dataset files found in: {directory}"
             )
 
+        # ---------------------------------------------------------
+        # Validate resume point
+        # ---------------------------------------------------------
+
+        if start_file:
+
+            matching_files = [
+                file_path
+                for file_path in files
+                if file_path.name == start_file
+            ]
+
+            if not matching_files:
+                raise FileNotFoundError(
+                    f"Start file not found in dataset: {start_file}"
+                )
+
+            if len(matching_files) > 1:
+                raise ValueError(
+                    f"Multiple files found with the same name: "
+                    f"{start_file}"
+                )
+
+        # ---------------------------------------------------------
+        # Stream files
+        # ---------------------------------------------------------
+
         for file_path in files:
+
+            if start_file and file_path.name < start_file:
+                continue
+
             yield from self._load_file(file_path)
 
     def _discover_files(
@@ -80,6 +120,8 @@ class DatasetLoader:
 
         Native:
             .txt → SNDlib native parser
+
+        Files are returned in deterministic sorted order.
         """
 
         files = []

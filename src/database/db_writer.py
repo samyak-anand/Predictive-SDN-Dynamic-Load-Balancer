@@ -24,12 +24,12 @@ POSTGRES_USER = os.getenv("POSTGRES_USER", "sdn_user")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "sdn_password")
 
 # PostgreSQL transaction batch size.
-# 50K is recommended for the historical 6M+ load.
-BATCH_SIZE = int(os.getenv("DB_BATCH_SIZE", "50000"))
+# 100K is recommended for the historical 6M+ load.
+BATCH_SIZE = int(os.getenv("DB_BATCH_SIZE", "20000"))
 
 # Kafka poll size. Keep this below BATCH_SIZE so the consumer
 # remains responsive while the application accumulates a DB batch.
-KAFKA_POLL_RECORDS = int(os.getenv("KAFKA_POLL_RECORDS", "10000"))
+KAFKA_POLL_RECORDS = int(os.getenv("KAFKA_POLL_RECORDS", "5000"))
 
 # Time-based flush is only a safety valve for sparse traffic.
 FLUSH_INTERVAL_SECONDS = int(os.getenv("DB_FLUSH_INTERVAL_SECONDS", "30"))
