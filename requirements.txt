@@ -1,4 +1,10 @@
+numpy==2.2.6
+pandas==2.2.3
+pyarrow==19.0.1
 kafka-python==3.0.11
 psycopg==3.3.5
 psycopg-binary==3.3.5
-typing_extensions==4.16.0
+matplotlib==3.11.2
+seaborn==0.13.2
+jupyter==1.1.1
+ipykernel==7.3.0
