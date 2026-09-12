@@ -1,0 +1,42 @@
+# Python virtual environments
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Testing / tooling cache
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Environment / secrets
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python packaging
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+logs/
+
+# Local data / generated artifacts
+data/raw/
+data/processed/
+data/ml/
